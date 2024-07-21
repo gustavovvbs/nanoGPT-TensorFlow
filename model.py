@@ -6,7 +6,8 @@ n_embed = 512
 n_heads = 16
 block_size = 8 
 head_size = n_embed // n_heads 
-
+vocab_size = 100
+n_blocks = 6
 
 
 
@@ -88,7 +89,41 @@ class Block(tf.keras.Model):
 
         return x
 
-blockex = Block(n_heads, n_embed)
-outputex = blockex(tf.random.normal(shape = (16, 8, n_embed)))
+class NanoGPT(tf.keras.Model):
+    def __init__(self):
+        super().__init__()
 
-print(outputex)
+        self.embedding_matrix = tf.keras.layers.Embedding(vocab_size, n_embed)
+        self.pos_emb = tf.keras.layers.Embedding(block_size, n_embed)
+        
+        self.blocks = tf.keras.Sequential([
+            Block(n_heads, n_embed) for _ in range(n_blocks)
+        ])
+
+        self.lnorm = tf.keras.layers.LayerNormalization()
+        self.flog = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, x, targets = None):
+        B, T = x.shape 
+
+        token_embeddings = self.embedding_matrix(x) #(B, T, E)
+        pos_embeddings = self.pos_emb(tf.range(T))#(T, E)
+        x = token_embeddings + pos_embeddings #(B, T, E)
+
+        x = self.blocks(x)
+        x = self.lnorm(x)
+
+        vocab_logits = self.flog(x) #(B, T, VOCAB_SIZE)
+
+        if targets is None:
+            loss = None 
+        else:
+            B, T, V_S = vocab_logits.shape
+            loss = tf.keras.losses.CategoricalCrossentropy(targets, vocab_logits)
+
+        return vocab_logits, loss
+
+sla = NanoGPT()
+teste = sla(tf.random.normal(shape = (16, 8)))
+print(teste)
+
