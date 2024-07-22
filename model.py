@@ -9,14 +9,32 @@ head_size = n_embed // n_heads
 vocab_size = 100
 n_blocks = 6
 
+with open('data.txt', 'r', encoding = 'utf-8') as f:
+    text = f.read()
 
+vocab = sorted(set(text))
+vocab_size = len(vocab)
+n_tokens = len(text)
 
+text_vec_layer = tf.keras.layers.TextVectorization(max_tokens = vocab_size)
+text_vec_layer.adapt(text)
+encoded_text = text_vec_layer([text])[0]
 
+n = int(len(text_vec_layer.get_vocabulary())*0.9)
+raw_train_set = encoded_text[:n]
+raw_test_set = encoded_text[n:]
 
+def to_dataset(sequence, length, shuffle = False, seed = None, batch_size = 32):
+    ds = tf.data.Dataset.from_tensor_slices(sequence)
+    ds = ds.window(length + 1, shift = 1, drop_remainder = True)
+    ds = ds.flat_map(lambda window_ds: window_ds.batch(length + 1))
+    if shuffle:
+        ds = ds.shuffle(100000, seed = seed)
+    ds = ds.batch(batch_size)
+    return ds.map(lambda window: (window[:, :-1], window[:, 1:])).prefetch(1)
 
-
-
-
+train_set = to_dataset(raw_train_set, shuffle = True, length = 8)
+test_set = to_dataset(raw_test_set, length = 8)
 
 
 class AttentionHead(tf.keras.Model):
@@ -103,7 +121,7 @@ class NanoGPT(tf.keras.Model):
         self.lnorm = tf.keras.layers.LayerNormalization()
         self.flog = tf.keras.layers.Dense(vocab_size)
 
-    def call(self, x, targets = None):
+    def call(self, x):
         B, T = x.shape 
 
         token_embeddings = self.embedding_matrix(x) #(B, T, E)
@@ -133,7 +151,25 @@ class NanoGPT(tf.keras.Model):
 
         return idx
 
-sla = NanoGPT()
-teste = sla.generate(tf.keras.random.randint(shape = (16, 8), minval=0, maxval=99), 2)
-print(teste.shape)
+
+
+if __name__ == '__main__':
+    gpt = NanoGPT()
+    optimizer = tf.keras.optimizers.AdamW()
+    ce = tf.keras.losses.SparseCategoricalCrossentropy()
+    epochs = 3
+    for i in range(epochs):
+        with tf.GradientTape() as tape:
+            for item in train_set:
+                gen_logits = gpt(item[0])
+                loss = ce(item[1], gen_logits)
+                print(f'********EPOCH: {i}/{epochs}')
+                print(f'Loss: {loss}')
+            gradients = tape.gradient(loss, gpt.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, gpt.trainable_variables))
+
+
+
+
+    
 
