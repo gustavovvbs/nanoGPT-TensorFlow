@@ -34,9 +34,9 @@ class AttentionHead(tf.keras.Model):
         k = self.key(x)
         v = self.value(x)
 
-        trig = tf.linalg.band_part(tf.ones(shape = (T, T)), -1, 0) * (head_size)**-0.5
+        trig = tf.linalg.band_part(tf.ones(shape = (T, T)), -1, 0)
 
-        att_w = q @ tf.transpose(k, perm = [0, 2, 1])
+        att_w = (q @ tf.transpose(k, perm = [0, 2, 1])) * (head_size)**-0.5
 
         att_w = tf.where(trig == 0, -np.inf, att_w)
 
@@ -108,22 +108,32 @@ class NanoGPT(tf.keras.Model):
 
         token_embeddings = self.embedding_matrix(x) #(B, T, E)
         pos_embeddings = self.pos_emb(tf.range(T))#(T, E)
+            
         x = token_embeddings + pos_embeddings #(B, T, E)
-
         x = self.blocks(x)
         x = self.lnorm(x)
 
         vocab_logits = self.flog(x) #(B, T, VOCAB_SIZE)
 
-        if targets is None:
-            loss = None 
-        else:
-            B, T, V_S = vocab_logits.shape
-            loss = tf.keras.losses.CategoricalCrossentropy(targets, vocab_logits)
+        return vocab_logits
 
-        return vocab_logits, loss
+    def generate(self, idx, max_tokens):
+        for _ in range(max_tokens):
+            croped_idx = idx[:, -block_size:]
+
+            logits = self.call(croped_idx)
+
+            last_ts = logits[:, -1, :] #(B, C)
+
+            logits_norm = tf.nn.softmax(last_ts, axis = -1)
+
+            sampled_idx = tf.random.categorical(logits_norm, num_samples=1, dtype=tf.int32) #(B, 1)
+
+            idx = tf.concat([idx, sampled_idx], axis = 1)
+
+        return idx
 
 sla = NanoGPT()
-teste = sla(tf.random.normal(shape = (16, 8)))
-print(teste)
+teste = sla.generate(tf.keras.random.randint(shape = (16, 8), minval=0, maxval=99), 2)
+print(teste.shape)
 
