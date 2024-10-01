@@ -6,32 +6,30 @@ from tensorflow.keras.layers import (
     Embedding,
     LayerNormalization,
     Dropout,
-    ReLU,
     TextVectorization,
 )
-from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.models import Model
+import time
 
 # -------------------------------
 # Configuration and Hyperparameters
 # -------------------------------
 
-# Display available GPU devices
 print("Available GPU devices:", tf.config.list_physical_devices("GPU"))
 
 # Model hyperparameters
 EMBED_DIM = 512          # Dimension of token embeddings
-NUM_HEADS = 16           # Number of attention heads
-BLOCK_SIZE = 8           # Context size (sequence length)
+NUM_HEADS = 8            # Number of attention heads
+BLOCK_SIZE = 128         # Context size (sequence length)
 HEAD_DIM = EMBED_DIM // NUM_HEADS  # Dimension per attention head
-VOCAB_SIZE = 100         # Initial vocabulary size 
+VOCAB_SIZE = 100         # Maximum vocabulary size (will be updated after preprocessing)
 NUM_BLOCKS = 6           # Number of transformer blocks
-DROPOUT_RATE = 0.2       # Dropout rate for regularization
+DROPOUT_RATE = 0.1       # Dropout rate for regularization
 
-# Training hyperparameters
-BATCH_SIZE = 32
-EPOCHS = 200
+BATCH_SIZE = 64
+EPOCHS = 10
 LEARNING_RATE = 1e-3
-TRAIN_SPLIT = 0.9        
+TRAIN_SPLIT = 0.9
 
 SHUFFLE_BUFFER_SIZE = 10000
 PREFETCH_BUFFER_SIZE = tf.data.AUTOTUNE
@@ -41,50 +39,32 @@ PREFETCH_BUFFER_SIZE = tf.data.AUTOTUNE
 # -------------------------------
 
 def load_text_data(file_path):
-    """
-    Load text data from a specified file.
-
-    Args:
-        file_path (str): Path to the text file.
-
-    Returns:
-        str: Content of the text file.
-    """
     with open(file_path, "r", encoding="utf-8") as file:
         return file.read()
 
 def preprocess_text(text, max_tokens=None):
-    """
-    Preprocess the text by creating a vocabulary and encoding the text.
+    vectorizer = TextVectorization(
+        max_tokens=max_tokens,
+        output_mode="int",
+        split='character',  # Split text into individual characters
+        standardize=None,   # Do not standardize (e.g., lowercasing)
+    )
+    vectorizer.adapt([text])
 
-    Args:
-        text (str): Raw text data.
-        max_tokens (int, optional): Maximum number of tokens in the vocabulary.
+    encoded_text = vectorizer([text])  # (1, sequence_length)
+    encoded_text = tf.squeeze(encoded_text, axis=0)  #(sequence_length,)
 
-    Returns:
-        tuple: (encoded_text, vocab_size, vectorizer)
-    """
-
-    vocab = sorted(set(text))
-    vocab_size = len(vocab)
-    if max_tokens:
-        vocab = vocab[:max_tokens]
-        vocab_size = len(vocab)
-
-    vectorizer = TextVectorization(max_tokens=vocab_size, output_mode="int")
-    vectorizer.adapt(text)
-
-    # encode to sequence of tokens
-    encoded_text = vectorizer(text)
+    vocab_size = len(vectorizer.get_vocabulary())
 
     return encoded_text, vocab_size, vectorizer
 
 data_file = "data.txt"
 print(f"Loading data from {data_file}...")
 raw_text = load_text_data(data_file)
-encoded_text, VOCAB_SIZE, vectorizer = preprocess_text(raw_text)
+encoded_text, VOCAB_SIZE, vectorizer = preprocess_text(raw_text, max_tokens=VOCAB_SIZE)
 
-split_index = int(encoded_text.shape[0]* TRAIN_SPLIT)
+print(encoded_text)
+split_index = int(encoded_text.shape[0] * TRAIN_SPLIT)
 train_sequence = encoded_text[:split_index]
 test_sequence = encoded_text[split_index:]
 
@@ -98,34 +78,19 @@ print(f"Testing tokens: {len(test_sequence)}")
 # -------------------------------
 
 def create_dataset(sequence, sequence_length, batch_size, shuffle=False, seed=None):
-    """
-    Convert a sequence of tokens into a TensorFlow dataset.
-
-    Args:
-        sequence (np.ndarray): Array of token IDs.
-        sequence_length (int): Length of each input sequence.
-        batch_size (int): Number of samples per batch.
-        shuffle (bool, optional): Whether to shuffle the dataset.
-        seed (int, optional): Random seed for shuffling.
-
-    Returns:
-        tf.data.Dataset: Prepared dataset.
-    """
     dataset = tf.data.Dataset.from_tensor_slices(sequence)
 
-    # Create sliding windows of size `sequence_length + 1`
-    dataset = dataset.window(sequence_length + 1, shift=1, drop_remainder=True)
-    dataset = dataset.flat_map(lambda window: window.batch(sequence_length + 1))
+    sequences = dataset.batch(sequence_length + 1, drop_remainder=True)
 
     if shuffle:
-        dataset = dataset.shuffle(SHUFFLE_BUFFER_SIZE, seed=seed)
+        sequences = sequences.shuffle(SHUFFLE_BUFFER_SIZE, seed=seed)
 
-    # Split into input and target sequences
-    dataset = dataset.map(
-        lambda window: (window[:-1], window[1:]),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
+    def split_input_target(chunk):
+        input_text = chunk[:-1]
+        target_text = chunk[1:]
+        return input_text, target_text
 
+    dataset = sequences.map(split_input_target, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.batch(batch_size, drop_remainder=True)
     dataset = dataset.prefetch(PREFETCH_BUFFER_SIZE)
 
@@ -138,7 +103,6 @@ train_dataset = create_dataset(
     shuffle=True,
     seed=42,
 )
-
 test_dataset = create_dataset(
     test_sequence,
     sequence_length=BLOCK_SIZE,
@@ -150,318 +114,129 @@ test_dataset = create_dataset(
 # Model Components
 # -------------------------------
 
-class AttentionHead(Model):
-    """
-    Single attention head computing self-attention.
-
-    Attributes:
-        key (Dense): Dense layer to compute key vectors.
-        query (Dense): Dense layer to compute query vectors.
-        value (Dense): Dense layer to compute value vectors.
-        proj (Dense): Dense layer to project the concatenated outputs.
-    """
-    def __init__(self, head_size, embed_dim, **kwargs):
-        super(AttentionHead, self).__init__(**kwargs)
-        self.key = Dense(head_size, name="key")
-        self.query = Dense(head_size, name="query")
-        self.value = Dense(head_size, name="value")
-        self.proj = Dense(embed_dim, name="proj")
-
-    def call(self, x):
-        """
-        Forward pass for the attention head.
-
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch, time, embed_dim).
-
-        Returns:
-            tf.Tensor: Output tensor after attention and projection.
-        """
-        # Compute query, key, and value vectors
-        q = self.query(x)  # (batch, time, head_size)
-        k = self.key(x)    # (batch, time, head_size)
-        v = self.value(x)  # (batch, time, head_size)
-
-        # Compute scaled dot-product attention scores
-        attention_scores = tf.matmul(q, k, transpose_b=True)  # (batch, time, time)
-        scaling_factor = tf.math.sqrt(tf.cast(HEAD_DIM, tf.float32))
-        attention_scores /= scaling_factor
-
-        # causal mask to ensure attention is only to past tokens
-        causal_mask = tf.linalg.band_part(tf.ones((tf.shape(x)[1], tf.shape(x)[1])), -1, 0)
-        attention_scores = tf.where(
-            causal_mask == 0, tf.fill(tf.shape(attention_scores), -1e9), attention_scores
-        )
-
-        attention_weights = tf.nn.softmax(attention_scores, axis=-1)  # (batch, time, time)
-
-        # attention output
-        attention_output = tf.matmul(attention_weights, v)  # (batch, time, head_size)
-
-        # Projection layer to the skip connection
-        output = self.proj(attention_output)  # (batch, time, embed_dim)
-
-        return output
-
 class MultiHeadAttention(Model):
-    """
-    Multi-head attention layer consisting of multiple attention heads.
-
-    Attributes:
-        heads (list of AttentionHead): List of attention heads.
-        concat_proj (Dense): Dense layer to project concatenated heads.
-        dropout (Dropout): Dropout layer for regularization.
-    """
-    def __init__(self, num_heads, head_size, embed_dim, dropout_rate=0.2, **kwargs):
+    def __init__(self, num_heads, head_dim, **kwargs):
         super(MultiHeadAttention, self).__init__(**kwargs)
-        self.heads = [
-            AttentionHead(head_size=head_size, embed_dim=embed_dim, name=f"head_{i}")
-            for i in range(num_heads)
-        ]
-        self.concat_proj = Dense(embed_dim, name="concat_proj")
-        self.dropout = Dropout(dropout_rate)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.all_head_dim = num_heads * head_dim
 
-    def call(self, x):
-        """
-        Forward pass for multi-head attention.
+        self.qkv = Dense(self.all_head_dim * 3, use_bias=False, name="qkv")
+        self.out_proj = Dense(self.all_head_dim, use_bias=False, name="out_proj")
+        self.dropout = Dropout(DROPOUT_RATE)
 
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch, time, embed_dim).
+    def call(self, x, training):
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[1]
+        qkv = self.qkv(x)  # (batch_size, seq_length, all_head_dim * 3)
+        qkv = tf.reshape(qkv, [batch_size, seq_length, 3, self.num_heads, self.head_dim])
+        qkv = tf.transpose(qkv, perm=[2, 0, 3, 1, 4])  # (3, batch_size, num_heads, seq_length, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        Returns:
-            tf.Tensor: Output tensor after multi-head attention.
-        """
-        # Concatenate outputs from all attention heads
-        head_outputs = [head(x) for head in self.heads]  # List of len(heads) (batch, time, embed_dim)
-        concatenated = tf.concat(head_outputs, axis=-1)  # (batch, time, embed_dim * num_heads)
+        scaling = float(self.head_dim) ** -0.5
+        q = q * scaling
 
-        # Project the concatenated outputs and apply dropout
-        projected = self.concat_proj(concatenated)  # (batch, time, embed_dim)
-        output = self.dropout(projected)
+        attention_scores = tf.matmul(q, k, transpose_b=True)  # (batch_size, num_heads, seq_length, seq_length)
 
+        mask = tf.linalg.band_part(tf.ones((seq_length, seq_length)), -1, 0)
+        mask = tf.cast(mask, dtype=tf.float32)
+        attention_scores = attention_scores * mask - 1e10 * (1 - mask)
+
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = self.dropout(attention_probs, training=training)
+
+        attention_output = tf.matmul(attention_probs, v)  # (batch_size, num_heads, seq_length, head_dim)
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # (batch_size, seq_length, num_heads, head_dim)
+        attention_output = tf.reshape(attention_output, [batch_size, seq_length, self.all_head_dim])
+
+        output = self.out_proj(attention_output)
         return output
 
 class FeedForward(Model):
-    """
-    Fully connected feed-forward network with ReLU activation.
-
-    Attributes:
-        dense1 (Dense): First dense layer expanding the embedding dimension.
-        activation (ReLU): ReLU activation layer.
-        dropout (Dropout): Dropout layer for regularization.
-        dense2 (Dense): Second dense layer projecting back to embedding dimension.
-    """
-    def __init__(self, embed_dim, dropout_rate=0.2, **kwargs):
+    def __init__(self, embed_dim, **kwargs):
         super(FeedForward, self).__init__(**kwargs)
-        self.dense1 = Dense(embed_dim * 4, name="ff_dense1")
-        self.activation = ReLU(name="ff_relu")
-        self.dropout = Dropout(dropout_rate)
+        self.dense1 = Dense(embed_dim * 4, activation='gelu', name="ff_dense1")
         self.dense2 = Dense(embed_dim, name="ff_dense2")
+        self.dropout = Dropout(DROPOUT_RATE)
 
-    def call(self, x):
-        """
-        Forward pass for the feed-forward network.
-
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch, time, embed_dim).
-
-        Returns:
-            tf.Tensor: Output tensor after feed-forward operations.
-        """
+    def call(self, x, training):
         x = self.dense1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+        x = self.dropout(x, training=training)
         x = self.dense2(x)
         return x
 
 class TransformerBlock(Model):
-    """
-    Single transformer block consisting of multi-head attention and feed-forward network.
-
-    Attributes:
-        layer_norm1 (LayerNormalization): Layer normalization before attention.
-        multi_head_attention (MultiHeadAttention): Multi-head attention layer.
-        layer_norm2 (LayerNormalization): Layer normalization before feed-forward.
-        feed_forward (FeedForward): Feed-forward network.
-    """
-    def __init__(self, num_heads, head_size, embed_dim, dropout_rate=0.2, **kwargs):
+    def __init__(self, num_heads, head_dim, embed_dim, **kwargs):
         super(TransformerBlock, self).__init__(**kwargs)
-        self.layer_norm1 = LayerNormalization(epsilon=1e-6, name="ln1")
-        self.multi_head_attention = MultiHeadAttention(
-            num_heads=num_heads,
-            head_size=head_size,
-            embed_dim=embed_dim,
-            dropout_rate=dropout_rate,
-            name="multi_head_attention",
-        )
-        self.layer_norm2 = LayerNormalization(epsilon=1e-6, name="ln2")
-        self.feed_forward = FeedForward(embed_dim=embed_dim, dropout_rate=dropout_rate, name="feed_forward")
+        self.layer_norm1 = LayerNormalization(epsilon=1e-5, name="ln1")
+        self.mha = MultiHeadAttention(num_heads=num_heads, head_dim=head_dim, name="multi_head_attention")
+        self.layer_norm2 = LayerNormalization(epsilon=1e-5, name="ln2")
+        self.ffn = FeedForward(embed_dim=embed_dim, name="feed_forward")
 
-    def call(self, x):
-        """
-        Forward pass for the transformer block.
+    def call(self, x, training):
+        residual = x
+        x = self.layer_norm1(x)
+        x = self.mha(x, training=training)
+        x = residual + x
 
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch, time, embed_dim).
-
-        Returns:
-            tf.Tensor: Output tensor after transformer block.
-        """
-        # mha with skip connection
-        attention_output = self.multi_head_attention(self.layer_norm1(x))
-        x = x + attention_output
-
-        # mlp with skip connection
-        ff_output = self.feed_forward(self.layer_norm2(x))
-        x = x + ff_output
-
+        residual = x
+        x = self.layer_norm2(x)
+        x = self.ffn(x, training=training)
+        x = residual + x
         return x
 
 class NanoGPT(Model):
-    """
-    A minimalist GPT-like model.
-
-    Attributes:
-        token_embedding (Embedding): Embedding layer for tokens.
-        position_embedding (Embedding): Embedding layer for positional encoding.
-        transformer_blocks (Sequential): Stack of transformer blocks.
-        layer_norm (LayerNormalization): Final layer normalization.
-        logits_dense (Dense): Dense layer to produce logits for each token in the vocabulary.
-    """
-    def __init__(self, vocab_size, embed_dim, num_heads, num_blocks, block_size, dropout_rate=0.2, **kwargs):
+    def __init__(self, vocab_size, embed_dim, num_heads, num_blocks, block_size, **kwargs):
         super(NanoGPT, self).__init__(**kwargs)
         self.token_embedding = Embedding(input_dim=vocab_size, output_dim=embed_dim, name="token_embedding")
         self.position_embedding = Embedding(input_dim=block_size, output_dim=embed_dim, name="position_embedding")
+        self.dropout = Dropout(DROPOUT_RATE)
+        self.blocks = [TransformerBlock(num_heads=num_heads, head_dim=embed_dim // num_heads, embed_dim=embed_dim, name=f"block_{i}") for i in range(num_blocks)]
+        self.layer_norm = LayerNormalization(epsilon=1e-5, name="ln_f")
+        self.head = Dense(vocab_size, name="head")
 
-        # stack of transformer blocks
-        self.transformer_blocks = Sequential(
-            [
-                TransformerBlock(
-                    num_heads=num_heads,
-                    head_size=embed_dim // num_heads,
-                    embed_dim=embed_dim,
-                    dropout_rate=dropout_rate,
-                    name=f"transformer_block_{i}",
-                )
-                for i in range(num_blocks)
-            ],
-            name="transformer_blocks",
-        )
+    def call(self, idx, training):
+        batch_size = tf.shape(idx)[0]
+        seq_length = tf.shape(idx)[1]
+        token_embeddings = self.token_embedding(idx)  # (batch_size, seq_length, embed_dim)
+        positions = tf.range(seq_length)
+        position_embeddings = self.position_embedding(positions)[tf.newaxis, ...]  # (1, seq_length, embed_dim)
+        x = token_embeddings + position_embeddings
+        x = self.dropout(x, training=training)
 
-        self.layer_norm = LayerNormalization(epsilon=1e-6, name="final_layer_norm")
-        self.logits_dense = Dense(vocab_size, name="logits_dense")
+        for block in self.blocks:
+            x = block(x, training=training)
 
-    def call(self, x):
-        """
-        Forward pass for the NanoGPT model.
-
-        Args:
-            x (tf.Tensor): Input tensor of shape (batch, time).
-
-        Returns:
-            tf.Tensor: Logits of shape (batch, time, vocab_size).
-        """
-        batch_size, seq_length = tf.shape(x)[0], tf.shape(x)[1]
-
-        token_embeddings = self.token_embedding(x)  # (batch, time, embed_dim)
-
-        # Positional embeddings
-        positions = tf.range(start=0, limit=seq_length, delta=1)
-        position_embeddings = self.position_embedding(positions)  # (time, embed_dim)
-        position_embeddings = tf.expand_dims(position_embeddings, 0)  # (1, time, embed_dim)
-
-        # Combine token and positional embeddings
-        x = token_embeddings + position_embeddings  # (batch, time, embed_dim)
-
-        # Pass through transformer blocks
-        x = self.transformer_blocks(x)  # (batch, time, embed_dim)
-
-        # Final layer normalization
-        x = self.layer_norm(x)  # (batch, time, embed_dim)
-
-        # Compute logits for each token in the vocabulary
-        logits = self.logits_dense(x)  # (batch, time, vocab_size)
-
+        x = self.layer_norm(x)
+        logits = self.head(x)
         return logits
 
     def generate(self, input_ids, max_new_tokens):
-        """
-        Generate new tokens based on the input sequence.
-
-        Args:
-            input_ids (tf.Tensor): Tensor of shape (batch, time) containing input token IDs.
-            max_new_tokens (int): Number of tokens to generate.
-
-        Returns:
-            tf.Tensor: Tensor containing the generated token IDs.
-        """
         for _ in range(max_new_tokens):
-            # truncate input to the block size
-            input_ids_truncated = input_ids[:, -BLOCK_SIZE:]
-
-            logits = self.call(input_ids_truncated)  # (batch, time, vocab_size)
-
-            # extract logits for the last time step
-            last_logits = logits[:, -1, :]  # (batch, vocab_size)
-
-            # sample the next token 
-            sampled_ids = tf.random.categorical(last_logits, num_samples=1)  # (batch, 1)
-            sampled_ids = tf.squeeze(sampled_ids, axis=-1)  # (batch,)
-
-            # append the sampled token to the input_ids
-            input_ids = tf.concat([input_ids, tf.expand_dims(sampled_ids, axis=-1)], axis=1)
-
+            idx_cond = input_ids[:, -BLOCK_SIZE:]
+            logits = self(idx_cond, training=False)
+            logits = logits[:, -1, :]  # (batch_size, vocab_size)
+            next_token = tf.argmax(logits, axis=-1)
+            next_token = next_token[:, tf.newaxis]  # (batch_size, 1)
+            input_ids = tf.concat([input_ids, next_token], axis=1)
         return input_ids
+
+def decode_tokens(token_ids, vectorizer):
+    vocab = vectorizer.get_vocabulary()
+    tokens = [vocab[token_id] for token_id in token_ids.numpy()]
+    return "".join(tokens)
+
+def generate_text(model, start_string, vectorizer, max_new_tokens=100):
+    input_ids = vectorizer([start_string])[0]
+    input_ids = tf.expand_dims(input_ids, 0)  # (1, time)
+    generated_ids = model.generate(input_ids, max_new_tokens=max_new_tokens)
+    generated_text = decode_tokens(generated_ids[0], vectorizer)
+    return generated_text
 
 # -------------------------------
 # Model Compilation and Training
 # -------------------------------
 
-def train_model(model, optimizer, train_dataset, test_dataset, epochs=10, generate_text_callback=True):
-    """
-    Train the model on the provided datasets.
-
-    Args:
-        model (tf.keras.Model): The model to train.
-        train_dataset (tf.data.Dataset): Training dataset.
-        test_dataset (tf.data.Dataset): Testing dataset.
-        epochs (int, optional): Number of training epochs.
-        generate_text_callback (bool, optional): Whether to generate text during training.
-
-    Returns:
-        dict: A dictionary with training loss history.
-    """
-
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    train_loss_history = []
-
-    for epoch in range(epochs):
-        epoch_loss = 0
-        num_batches = 0
-        for idx, (x, y) in enumerate(train_dataset):
-            with tf.GradientTape() as tape:
-                logits = model(x)
-                loss = loss_fn(y, logits)
-
-            gradients = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-
-            epoch_loss += loss.numpy()
-            num_batches += 1
-
-            if idx % 10 == 0:
-                print(f"Epoch {epoch+1}, Step {idx}, Loss: {loss.numpy()}")
-
-        avg_loss = epoch_loss / num_batches
-        train_loss_history.append(avg_loss)
-
-        if generate_text_callback:
-            generated_text = generate_text(model, "Once upon a time", vectorizer, max_new_tokens=100)
-            print('GENERATED TEXT AT EPOCH', epoch + 1, ':', generated_text)
-
-    return {"loss": train_loss_history}
-
-# Instantiate the model
 print("Initializing NanoGPT model...")
 gpt_model = NanoGPT(
     vocab_size=VOCAB_SIZE,
@@ -469,75 +244,42 @@ gpt_model = NanoGPT(
     num_heads=NUM_HEADS,
     num_blocks=NUM_BLOCKS,
     block_size=BLOCK_SIZE,
-    dropout_rate=DROPOUT_RATE,
 )
 
-# Optimizer definition
-optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, epsilon=1e-8)
+optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
-# Train the model
-print("Starting training...")
-history = train_model(gpt_model, optimizer, train_dataset, test_dataset, epochs=EPOCHS, generate_text_callback=True)
+train_loss_metric = tf.keras.metrics.Mean()
 
-# -------------------------------
-# Saving the Model
-# -------------------------------
+def train_step(x, y):
+    with tf.GradientTape() as tape:
+        logits = gpt_model(x, training=True)  # (batch_size, seq_length, vocab_size)
+        loss = loss_fn(y, logits)
+        loss += sum(gpt_model.losses)
 
-def save_model(model, save_path="nano_gpt_model"):
-    """
-    Save the trained model to a specified path.
+    gradients = tape.gradient(loss, gpt_model.trainable_variables)
+    gradients = [tf.clip_by_norm(g, 1.0) for g in gradients]
+    optimizer.apply_gradients(zip(gradients, gpt_model.trainable_variables))
+    train_loss_metric.update_state(loss)
+    mean_norm = sum([tf.norm(g).numpy() for g in gradients]) / len(gradients)
 
-    Args:
-        model (tf.keras.Model): The trained model.
-        save_path (str, optional): Directory path to save the model.
+    return loss, mean_norm
 
-    Returns:
-        None
-    """
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    model.save(save_path)
-    print(f"Model saved to {save_path}")
+for epoch in range(EPOCHS):
+    print(f"Epoch {epoch + 1}/{EPOCHS}")
+    start_time = time.time()
+    for step, (x_batch_train, y_batch_train) in enumerate(train_dataset):
+        B, T = x_batch_train.shape
+        step_start = time.time()
+        loss, norm = train_step(x_batch_train, y_batch_train)
+        step_end = time.time()
+        if step % 10 == 0:
+            print(f"Step {step}, Loss: {train_loss_metric.result().numpy():.4f}, norm: {norm}, token/s: {B*T/(step_end - step_start)}")
 
-# Save the trained model
-# save_model(gpt_model)
+    generated_text = generate_text(gpt_model, "Once upon a time", vectorizer, max_new_tokens=100)
+    print(f"\nGenerated Text after Epoch {epoch + 1}:\n{generated_text}\n")
 
+    time_taken = time.time() - start_time
+    print(f"Time taken for epoch {epoch + 1}: {time_taken:.2f} secs\n")
 
-# ------------------------------- TOKEN DECODING -------------------------------
-def decode_tokens(token_ids, vectorizer):
-    """
-    Decode a sequence of token IDs back to string.
-
-    Args:
-        token_ids (tf.Tensor): Tensor containing token IDs.
-        vectorizer (TextVectorization): Fitted TextVectorization layer.
-
-    Returns:
-        str: Decoded string.
-    """
-    vocab = vectorizer.get_vocabulary()
-    return "".join([vocab[token] for token in token_ids.numpy()])
-
-# Example generation
-def generate_text(model, start_string, vectorizer, max_new_tokens=50):
-    """
-    Generate text using the trained model starting from `start_string`.
-
-    Args:
-        model (NanoGPT): The trained NanoGPT model.
-        start_string (str): The initial string to start generation.
-        vectorizer (TextVectorization): Fitted TextVectorization layer.
-        max_new_tokens (int, optional): Number of tokens to generate.
-
-    Returns:
-        str: Generated text string.
-    """
-    # Encode the start string
-    input_ids = vectorizer([start_string])[0]
-    input_ids = tf.expand_dims(input_ids, 0)  # (1, time)
-
-    generated_ids = model.generate(input_ids, max_new_tokens=max_new_tokens)
-
-    # decode the generated tokens
-    return decode_tokens(generated_ids[0], vectorizer)
-
+gpt_model.save('nano_gpt_model')
