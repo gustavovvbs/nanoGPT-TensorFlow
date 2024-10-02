@@ -1,0 +1,12 @@
+{
+    "EMBED_DIM": 512,
+    "NUM_HEADS": 8,
+    "BLOCK_SIZE": 128,
+    "NUM_LAYERS": 6,
+    "DROPOUT_RATE": 0.1,
+    "LEARNING_RATE": 0.0001,
+    "BATCH_SIZE": 8,
+    "EPOCHS": 100,
+    "TRAIN_SPLIT": 0.9,
+    "VOCAB_SIZE": 100
+}
